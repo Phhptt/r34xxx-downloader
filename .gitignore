@@ -11,8 +11,8 @@ downloads/
 *.part
 metadata.jsonl
 r34dl.log
-history.db
-history.db-*
+history.db*
+*.bak
 
 # ---------------------------------------------------------------------------
 # Build output (PyInstaller). dist/ also holds the built .exe, its own copy of

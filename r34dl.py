@@ -25,6 +25,7 @@ import math
 import os
 import random
 import re
+import shutil
 import sqlite3
 import sys
 import threading
@@ -145,6 +146,14 @@ class History:
         return conn
 
     def _init_schema(self) -> None:
+        # Merging duplicates below deletes rows. Keep one copy of whatever the
+        # database looked like beforehand, once, in case a merge is unwelcome.
+        backup = self.path.with_suffix(".db.pre-merge.bak")
+        if self.path.is_file() and not backup.exists():
+            try:
+                shutil.copy2(self.path, backup)
+            except OSError as exc:
+                LOG.write(f"HISTORY backup failed: {exc}")
         try:
             with self._connect() as conn:
                 conn.execute("""
@@ -162,34 +171,63 @@ class History:
                         status        TEXT    NOT NULL DEFAULT 'running'
                     )
                 """)
+                merge_duplicate_runs(conn)
         except sqlite3.Error as exc:
             LOG.write(f"HISTORY schema init failed: {exc}")
 
     def start(self, tags: str, folder: Path) -> None:
+        """Claim the row for this query, reusing one if it already exists.
+
+        The table is a compendium of saved queries rather than a log of runs:
+        the same tags into the same folder is the *same* entry, re-executed.
+        """
+        tags = tags.strip()
+        target = _normalise_folder(folder)
+        now = datetime.now().isoformat(timespec="seconds")
         try:
             with self._lock, self._connect() as conn:
-                cur = conn.execute(
-                    "INSERT INTO runs (tags, started_at, folder) VALUES (?, ?, ?)",
-                    (tags, datetime.now().isoformat(timespec="seconds"),
-                     str(Path(folder).resolve())),
-                )
-                self.run_id = cur.lastrowid
+                existing = conn.execute(
+                    "SELECT id FROM runs WHERE tags = ? "
+                    "AND folder = ? COLLATE NOCASE ORDER BY id LIMIT 1",
+                    (tags, target),
+                ).fetchone()
+                if existing:
+                    self.run_id = existing[0]
+                    conn.execute(
+                        "UPDATE runs SET started_at = ?, finished_at = NULL, "
+                        "status = 'running' WHERE id = ?", (now, self.run_id))
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO runs (tags, started_at, folder) "
+                        "VALUES (?, ?, ?)", (tags, now, target))
+                    self.run_id = cur.lastrowid
         except sqlite3.Error as exc:
             LOG.write(f"HISTORY start failed: {exc}")
 
     def set_matched(self, matched: int | None) -> None:
         self._update("matched = ?", (matched,))
 
+    @staticmethod
+    def _held(counts: dict) -> int:
+        """How many of the matched posts are now on disk.
+
+        Newly saved plus skipped: on a re-check the skips are the files an
+        earlier run already fetched, so the pair reads as "you hold M of N"
+        rather than "this run happened to download 3".
+        """
+        return counts["saved"] + counts["skipped"]
+
     def progress(self, counts: dict) -> None:
         """Checkpoint mid-run so a crash still leaves how far it got."""
         self._update("downloaded = ?, skipped = ?, failed = ?",
-                     (counts["saved"], counts["skipped"], counts["failed"]))
+                     (self._held(counts), counts["skipped"], counts["failed"]))
 
     def finish(self, counts: dict, duration: float, status: str) -> None:
         self._update(
             "downloaded = ?, skipped = ?, failed = ?, duration_s = ?, "
             "finished_at = ?, status = ?",
-            (counts["saved"], counts["skipped"], counts["failed"], round(duration, 1),
+            (self._held(counts), counts["skipped"], counts["failed"],
+             round(duration, 1),
              datetime.now().isoformat(timespec="seconds"), status),
         )
 
@@ -202,6 +240,105 @@ class History:
                              (*values, self.run_id))
         except sqlite3.Error as exc:
             LOG.write(f"HISTORY update failed: {exc}")
+
+
+class _NoHistory:
+    """Stand-in used for dry runs, where nothing should be recorded."""
+
+    run_id = None
+
+    def start(self, *_a, **_k) -> None: ...
+    def set_matched(self, *_a, **_k) -> None: ...
+    def progress(self, *_a, **_k) -> None: ...
+    def finish(self, *_a, **_k) -> None: ...
+
+
+def merge_duplicate_runs(conn) -> int:
+    """Collapse rows sharing tags and folder, keeping the most recent.
+
+    Entries recorded before the table became a compendium can contain the same
+    query several times over; so can renaming one entry onto another. Returns
+    how many rows were removed.
+    """
+    rows = conn.execute(
+        "SELECT id, tags, folder FROM runs "
+        "ORDER BY COALESCE(finished_at, started_at) DESC, id DESC"
+    ).fetchall()
+    seen, doomed = set(), []
+    for row in rows:
+        key = (str(row[1]).strip(), os.path.normcase(str(row[2])))
+        if key in seen:
+            doomed.append(row[0])   # an older copy of a query we already kept
+        else:
+            seen.add(key)
+    if not doomed:
+        return 0
+    conn.execute(f"DELETE FROM runs WHERE id IN ({','.join('?' * len(doomed))})",
+                 doomed)
+    LOG.write(f"HISTORY merged {len(doomed)} duplicate entr"
+              f"{'y' if len(doomed) == 1 else 'ies'}")
+    return len(doomed)
+
+
+def history_runs(path: Path | None = None) -> list[dict]:
+    """Every recorded run, newest first. Empty list if the DB isn't there yet."""
+    db = Path(path or HISTORY_PATH)
+    if not db.is_file():
+        return []
+    try:
+        conn = sqlite3.connect(db, timeout=10)
+        conn.row_factory = sqlite3.Row
+        with conn:
+            rows = conn.execute(
+                "SELECT id, tags, started_at, finished_at, folder, matched, "
+                "downloaded, skipped, failed, duration_s, status "
+                "FROM runs ORDER BY COALESCE(finished_at, started_at) DESC"
+            ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except sqlite3.Error as exc:
+        LOG.write(f"HISTORY read failed: {exc}")
+        return []
+
+
+def update_history_run(run_id: int, path: Path | None = None, **fields) -> bool:
+    """Edit a recorded run in place. Only tags and folder may be changed."""
+    allowed = {k: v for k, v in fields.items() if k in ("tags", "folder")}
+    if not allowed:
+        return False
+    db = Path(path or HISTORY_PATH)
+    if not db.is_file():
+        return False
+    try:
+        with sqlite3.connect(db, timeout=10) as conn:
+            assignments = ", ".join(f"{k} = ?" for k in allowed)
+            conn.execute(f"UPDATE runs SET {assignments} WHERE id = ?",
+                         (*allowed.values(), int(run_id)))
+            # An edit can rename one entry onto another; entries are unique
+            # per tags+folder, so fold them together.
+            merge_duplicate_runs(conn)
+        return True
+    except sqlite3.Error as exc:
+        LOG.write(f"HISTORY edit failed: {exc}")
+        return False
+
+
+def delete_history_runs(run_ids, path: Path | None = None) -> int:
+    """Remove rows by id. Returns how many went."""
+    ids = [int(i) for i in run_ids]
+    if not ids:
+        return 0
+    db = Path(path or HISTORY_PATH)
+    if not db.is_file():
+        return 0
+    try:
+        with sqlite3.connect(db, timeout=10) as conn:
+            placeholders = ",".join("?" * len(ids))
+            cur = conn.execute(f"DELETE FROM runs WHERE id IN ({placeholders})", ids)
+            return cur.rowcount
+    except sqlite3.Error as exc:
+        LOG.write(f"HISTORY delete failed: {exc}")
+        return 0
 
 
 @dataclass
@@ -486,6 +623,19 @@ def last_folder() -> str:
     """The folder used for the previous run, or '' if there wasn't one."""
     value = read_config().get("last_folder")
     return value if isinstance(value, str) else ""
+
+
+def column_widths() -> dict:
+    """Saved history-table column widths, keyed by column name."""
+    widths = read_config().get("history_columns")
+    if not isinstance(widths, dict):
+        return {}
+    return {k: int(v) for k, v in widths.items()
+            if isinstance(v, (int, float)) and v > 0}
+
+
+def save_column_widths(widths: dict) -> None:
+    write_config(history_columns={k: int(v) for k, v in widths.items()})
 
 
 def remember_folder(folder: str | Path) -> list[str]:
@@ -835,7 +985,8 @@ def run_download(opts: Options, log=print, on_progress=None, on_total=None,
     meta_fh = open(out_dir / "metadata.jsonl", "a", encoding="utf-8") if opts.metadata else None
     started = time.monotonic()
 
-    history = History()
+    # A dry run is a preview; it must not claim or alter a compendium entry.
+    history = History() if not opts.dry_run else _NoHistory()
     history.start(opts.tags, out_dir)
     estimator = Estimator(client.limiter, None)
     # Batch = one window's worth of requests; used only for log checkpoints.
