@@ -163,13 +163,7 @@ Alongside the app you'll find `config.json` (your settings and key),
 
 ## A note on the code
 
-This app is mostly **vibe-coded** — the bulk of it was written by an AI with a
-human steering, reviewing and testing rather than typing. It works, it's used
-daily, and it's been tested against the real API, but it hasn't had the kind
-of careful review you'd want before trusting it with anything that matters.
-Have a read before you run it, as you should with anything off the internet.
-
-Bug reports and pull requests are welcome.
+This app is mostly **vibe-coded** — the bulk of it was written by an AI.
 
 ---
 
