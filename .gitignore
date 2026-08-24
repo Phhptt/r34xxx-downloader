@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# Secrets - never commit these.
+# config.json holds your API key. Use config.example.json as the template.
+# ---------------------------------------------------------------------------
+config.json
+
+# ---------------------------------------------------------------------------
+# Downloaded content and per-run data
+# ---------------------------------------------------------------------------
+downloads/
+*.part
+metadata.jsonl
+r34dl.log
+history.db
+history.db-*
+
+# ---------------------------------------------------------------------------
+# Build output (PyInstaller). dist/ also holds the built .exe, its own copy of
+# config.json, and whatever the app has downloaded - keep all of it out.
+# ---------------------------------------------------------------------------
+build/
+dist/
+*.spec
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---------------------------------------------------------------------------
+# Editors and tooling
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.claude/settings.local.json
